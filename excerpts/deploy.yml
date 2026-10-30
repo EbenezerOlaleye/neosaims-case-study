@@ -1,0 +1,200 @@
+# Excerpt from the private NeoSAIMS repository; project identifiers replaced with placeholders.
+# Every push to main: apply new Supabase migrations, then deploy the web app to Vercel.
+# Pull requests: new migrations are tried on the live database and rolled back (nothing is
+# saved), then a Vercel preview link is made.
+# Secrets (GitHub repo → Settings → Secrets and variables → Actions):
+#   SUPABASE_DB_URL    Supabase session-pooler connection string, with the database password
+#   VERCEL_TOKEN       https://vercel.com/account/tokens
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  database:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secrets
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          missing=""
+          for name in SUPABASE_DB_URL; do [ -n "${!name:-}" ] || missing="$missing $name"; done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing or empty repository secrets:$missing. Add them under Settings → Secrets and variables → Actions → Secrets (Repository secrets, exact names)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Only migrations added in this push may be applied. Anything else pending means the
+      # database history and supabase/migrations disagree, and applying old files could break
+      # live data, so stop and let a person sort it out.
+      - name: Check pending migrations
+        id: check
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          # main: the commit before this push; pull request: the branch it will merge into
+          BEFORE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          has_history=$(psql "$SUPABASE_DB_URL" -At -c "SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL")
+          if [ "$has_history" != t ]; then
+            echo "::error::Supabase has no migration history table yet. Nothing was changed."
+            exit 1
+          fi
+          applied=$(psql "$SUPABASE_DB_URL" -At -c "SELECT version FROM supabase_migrations.schema_migrations" | sort)
+          # Same rule as the Supabase CLI: only <digits>_<name>.sql files are migrations.
+          versions() { xargs -rn1 basename | grep -E '^[0-9]+_.*\.sql$' | grep -oE '^[0-9]+' | sort || true; }
+          local=$(ls supabase/migrations/*.sql | versions)
+          pending=$(comm -23 <(echo "$local") <(echo "$applied"))
+          if [ -z "$pending" ]; then echo "Database is up to date."; exit 0; fi
+
+          added=""
+          if [ -n "${BEFORE:-}" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            added=$(git diff --name-only --diff-filter=A "$BEFORE" HEAD -- supabase/migrations | versions)
+          fi
+          unexpected=$(comm -23 <(echo "$pending") <(echo "$added"))
+          echo "Pending: $(echo $pending)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::These migrations are not recorded as applied in Supabase and were not added in this push: $(echo $unexpected). Nothing was changed."
+            exit 1
+          fi
+          echo "pending=$(echo $pending)" >> "$GITHUB_OUTPUT"
+
+      # Like `supabase db push`: each file and its history entry in one transaction, oldest first.
+      # psql is used because it reads the connection string the same way as the check above.
+      - name: Try migrations (rolled back)
+        if: steps.check.outputs.pending != '' && github.event_name == 'pull_request'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PENDING: ${{ steps.check.outputs.pending }}
+        run: |
+          set -euo pipefail
+          # Files are tried together in one rolled-back transaction. A file that adds enum values
+          # (ALTER TYPE ... ADD VALUE) is tried on its own; files after it may use those values,
+          # which only exist once it is really applied, so they are checked when the push is deployed.
+          tried=""; skipped=""; batch=(); enum_added=false
+          run_batch() {
+            if [ ${#batch[@]} -gt 0 ]; then
+              psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -q -c "BEGIN" "${batch[@]}" -c "ROLLBACK"
+              batch=()
+            fi
+          }
+          for version in $PENDING; do
+            file=$(ls supabase/migrations/${version}_*.sql)
+            if $enum_added; then
+              skipped="$skipped $version"
+            elif grep -qiE 'ALTER[[:space:]]+TYPE[^;]*ADD[[:space:]]+VALUE' "$file"; then
+              run_batch
+              psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -q -c "BEGIN" -f "$file" -c "ROLLBACK"
+              tried="$tried $version"; enum_added=true
+            else
+              batch+=(-f "$file"); tried="$tried $version"
+            fi
+          done
+          run_batch
+          echo "These migrations apply cleanly to the live database (rolled back, nothing saved):$tried" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$skipped" ]; then
+            echo "::notice::Not tried here because they use enum values added in this pull request (checked on deploy):$skipped"
+            echo "Not tried (use enum values added in this pull request; checked on deploy):$skipped" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Apply migrations
+        if: steps.check.outputs.pending != '' && github.event_name != 'pull_request'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PENDING: ${{ steps.check.outputs.pending }}
+        run: |
+          set -euo pipefail
+          for version in $PENDING; do
+            file=$(ls supabase/migrations/${version}_*.sql)
+            name=$(basename "$file" .sql); name=${name#*_}
+            echo "Applying $(basename "$file")"
+            psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 --single-transaction -q \
+              -f "$file" \
+              -c "INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('$version', '$name')"
+          done
+
+  # Supabase Edge Functions (supabase/functions), after the database changes they rely on.
+  functions:
+    needs: database
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check access token
+        id: token
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+            echo "::warning::SUPABASE_ACCESS_TOKEN secret is missing, so Edge Functions were not deployed (adding users will not work until they are)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: supabase/setup-cli@v1
+        if: steps.token.outputs.skip != 'true'
+        with:
+          version: latest
+
+      - name: Deploy Edge Functions
+        if: steps.token.outputs.skip != 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        run: |
+          for dir in supabase/functions/*/; do
+            name=$(basename "$dir")
+            echo "Deploying $name"
+            supabase functions deploy "$name" --project-ref "$SUPABASE_PROJECT_REF"
+          done
+
+  web:
+    needs: database
+    if: always() && (needs.database.result == 'success' || needs.database.result == 'skipped')
+    runs-on: ubuntu-latest
+    env:
+      # Not secret: they only name the Vercel project (from .vercel/project.json).
+      VERCEL_ORG_ID: <vercel-team-id>
+      VERCEL_PROJECT_ID: <vercel-project-id>
+    steps:
+      - name: Check secrets
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          missing=""
+          for name in VERCEL_TOKEN; do [ -n "${!name:-}" ] || missing="$missing $name"; done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing or empty repository secrets:$missing. Add them under Settings → Secrets and variables → Actions → Secrets (Repository secrets, exact names)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PROD: ${{ github.event_name != 'pull_request' && '--prod' || '' }}
+          ENVIRONMENT: ${{ github.event_name != 'pull_request' && 'production' || 'preview' }}
+          # Pinned: a broken "latest" release once failed every deploy. Bump deliberately.
+          VERCEL: vercel@65.0.0
+        run: |
+          npx --yes "$VERCEL" pull --yes --environment="$ENVIRONMENT" --token="$VERCEL_TOKEN"
+          npx --yes "$VERCEL" build $PROD --token="$VERCEL_TOKEN"
+          url=$(npx --yes "$VERCEL" deploy --prebuilt $PROD --token="$VERCEL_TOKEN")
+          echo "Deployed: $url" | tee -a "$GITHUB_STEP_SUMMARY"
